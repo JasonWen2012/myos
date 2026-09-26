@@ -1,0 +1,8 @@
+# build artifacts
+build/
+images/*.img
+images/*.png
+# the user's own disk: their files, not the project's source
+data/
+__pycache__/
+*.pyc

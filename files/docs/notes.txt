@@ -1,0 +1,4 @@
+notes:
+  this file lives in a subdirectory on purpose
+  it exercises the path walk: /docs/notes.txt is three components deep
+  a directory is an inode whose data blocks hold 32-byte dirents
