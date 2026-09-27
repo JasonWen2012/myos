@@ -1,3 +1,5 @@
+**English** | [简体中文](./README-CN.md)
+
 # myos
 
 An x86 operating system written from scratch, running two kernels on top of its own bootloader and its own linker:
