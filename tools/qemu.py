@@ -220,15 +220,30 @@ class QemuProcess:
     # -------------------------------------------------------------------- input
 
     def send(self, text: str) -> None:
-        """Type into the guest's serial port."""
+        """Type into the guest's serial port.
+
+        A guest that dies mid-session (a panic through the debug-exit device, a
+        triple fault) closes this socket, and the write then raises.  That is
+        reported as `False` rather than as an exception: the transcript is what
+        explains *why* the guest died, and an exception thrown from here used to
+        discard it, which turns a diagnosable failure into a bare
+        `ConnectionResetError`.
+        """
         data = text.encode("utf-8")
         if self._socket is not None:
-            self._socket.sendall(data)
-            return
+            try:
+                self._socket.sendall(data)
+            except OSError:
+                return False
+            return True
         if self._process.stdin is None:
             raise RuntimeError("this QEMU has no stdin")
-        self._process.stdin.write(data)
-        self._process.stdin.flush()
+        try:
+            self._process.stdin.write(data)
+            self._process.stdin.flush()
+        except OSError:
+            return False
+        return True
 
     # ----------------------------------------------------------------- shut down
 
@@ -400,7 +415,12 @@ def run_session(image: Path, steps: Sequence[SessionStep], *, timeout: float = 6
             if step.wait and not process.wait_for(step.wait, timeout=step.timeout):
                 unmet.append(step.wait)
             if step.serial:
-                process.send(step.serial)
+                if not process.send(step.serial):
+                    # The guest is gone: the socket it was reading is closed.  Stop
+                    # driving it, and let the caller see the transcript -- which is
+                    # the only place the reason for the death is written down.
+                    unmet.append(f"(the guest died before: {step.serial.strip()!r})")
+                    break
             for key in step.keys:
                 monitor.send_key(key)
         finished = process.wait_for_exit(timeout=timeout)

@@ -16,16 +16,24 @@
 #include "file.h"
 #include "fs.h"
 #include "gdt.h"
+#include "heap.h"
 #include "idt.h"
 #include "io.h"
 #include "kernel.h"
 #include "keyboard.h"
+#include "klog.h"
 #include "libc.h"
 #include "mbr.h"
 #include "mem.h"
+#include "paging.h"
 #include "pic.h"
 #include "pit.h"
+#include "pmm.h"
+#include "sched.h"
+#include "syscall.h"
+#include "task.h"
 #include "types.h"
+#include "user.h"
 
 namespace myos {
 namespace {
@@ -116,7 +124,11 @@ void cmd_fact();
 void cmd_keylog();
 void cmd_reboot();
 void cmd_selftest();
+void cmd_check();
 void cmd_blk();
+void cmd_vm();
+void cmd_run();
+void cmd_dmesg();
 void cmd_fs();
 void cmd_df();
 void cmd_ls();
@@ -128,6 +140,8 @@ void cmd_rm();
 void cmd_sync();
 void cmd_fsck();
 void cmd_fstest();
+void cmd_ps();
+void cmd_schedtest();
 
 struct Command {
     const char* name;
@@ -144,6 +158,9 @@ const Command commands[] = {
     {"clear", cmd_clear, "blank the screen"},
     {"info", cmd_info, "kernel version, image, tables, ticks"},
     {"mem", cmd_mem, "the firmware's memory map"},
+    {"vm", cmd_vm, "physical pages, page tables, heap (`vm fault` proves the panic path)"},
+    {"run", cmd_run, "run a program from the volume in ring 3"},
+    {"dmesg", cmd_dmesg, "the kernel's own log, oldest first"},
     {"ticks", cmd_ticks, "timer ticks since boot"},
     {"fact", cmd_fact, "factorial of 0-8, computed recursively"},
     {"keylog", cmd_keylog, "what the keyboard driver has seen"},
@@ -159,7 +176,10 @@ const Command commands[] = {
     {"sync", cmd_sync, "flush and mark the volume cleanly unmounted"},
     {"fsck", cmd_fsck, "check the volume and reclaim what a lost write leaked"},
     {"fstest", cmd_fstest, "write, read, shrink and remove, then check it all back"},
+    {"ps", cmd_ps, "the task table: pid, state, CPU ticks, page directory"},
+    {"schedtest", cmd_schedtest, "create, preempt and reap tasks, then report"},
     {"reboot", cmd_reboot, "restart the machine"},
+    {"check", cmd_check, "run the in-guest checks and stay in the shell"},
     {"selftest", cmd_selftest, "run the in-guest checks and exit with the result"},
 };
 
@@ -330,6 +350,7 @@ void cmd_blk() {
         disk_write_test();
         return;
     }
+
     const AtaDevice* device = ata_probe();
     if (!device->present) {
         console_puts("blk: no ATA device on the primary channel (0x1F0)\n");
@@ -349,6 +370,51 @@ void cmd_blk() {
     if (ata_timeouts() != 0) {
         kprintf("blk: %u command(s) timed out and were abandoned\n", ata_timeouts());
     }
+}
+
+void cmd_vm() {
+    if (argument_count > 1 && equal_ignore_case(arguments[1], "fault")) {
+        // Deliberately write to memory that is not mapped.  The point is not the
+        // data, it is what the kernel does about it: a page fault that cannot be
+        // satisfied has to end in a report with the address in it, not in a triple
+        // fault that leaves nothing behind.
+        console_puts("vm: writing to 0xdeadb000, which is not mapped...\n");
+        volatile uint32* nowhere = reinterpret_cast<volatile uint32*>(0xDEADB000u);
+        *nowhere = 1;
+        console_puts("vm: the write did not fault, so the mapping is wrong\n");
+        return;
+    }
+    pmm_report();
+    paging_report();
+    heap_report();
+    user_report();
+}
+
+void cmd_dmesg() {
+    klog_report();
+}
+
+void cmd_run() {
+    if (!require_filesystem("run")) {
+        return;
+    }
+    if (argument_count < 2) {
+        console_puts("usage: run <path>\n");
+        console_puts("       run /bin/hello\n");
+        return;
+    }
+    // The kernel's shell is still the only shell; `run` hands control to a program in
+    // ring 3 and waits for its exit syscall, which comes back through
+    // return_to_kernel.  A program that faults instead of exiting leaves the kernel
+    // in the panic path, which is the point of running it at all.
+    UserRun result;
+    const int32 status = exec_user(arguments[1], &result);
+    if (status < 0) {
+        kprintf("run: %s: %s\n", arguments[1], sys_error_text(status));
+        return;
+    }
+    kprintf("run: %u page(s) of user address space, %u syscall(s)\n",
+            result.pages, result.syscalls);
 }
 
 void cmd_fs() {
@@ -737,6 +803,42 @@ void cmd_fstest() {
     kprintf("fstest: %u ok, %u failed; %u free blocks, %u free inodes\n",
             checks - failures, failures, fs_bitmap_free_blocks(),
             fs_bitmap_free_inodes());
+}
+
+// The checks without the exit.  `selftest` is for a headless run that wants a
+// verdict and is willing to end for it; `check` is for a person at the keyboard who
+// wants the same list and to keep their session -- and for a test that needs to run
+// the checks more than once to prove they can be run more than once.
+void cmd_check() {
+    static uint32 run = 0;
+    ++run;
+    console_puts("check: running the in-guest checks, the session continues\n");
+    const uint32 failed = kernel_self_test();
+    const uint32 skipped = kernel_checks_skipped();
+    kprintf("check: run %u: %u ok, %u skipped, %u failed\n", run,
+            kernel_checks_run() - failed, skipped, failed);
+    if (failed == 0) {
+        console_puts("check: everything the kernel can test about itself passed\n");
+    }
+}
+
+void cmd_ps() {
+    task_report();
+    sched_report();
+}
+
+// The scheduler checks on demand, for the same reason `check` exists: a session that
+// is already up can ask again, and a test can watch tasks being created, preempted and
+// reaped without booting for it.  The demo's own output (`sched: alpha round 1 ...`)
+// is deliberately not repeated here -- it belongs to the checks.
+void cmd_schedtest() {
+    console_puts("schedtest: creating two tasks and letting the timer preempt them\n");
+    const uint32 failed = kernel_scheduler_test();
+    kprintf("schedtest: %u ok, %u skipped, %u failed\n",
+            kernel_checks_run() - failed, kernel_checks_skipped(), failed);
+    if (failed == 0) {
+        console_puts("schedtest: every task ran, exited, and gave its stack back\n");
+    }
 }
 
 void cmd_selftest() {

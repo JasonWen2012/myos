@@ -56,6 +56,177 @@ def declared_constant(name: str, seen: tuple[str, ...] = ()) -> int:
     return int(eval(expression, {"__builtins__": {}}, values))  # noqa: S307
 
 
+class UserImageTests(unittest.TestCase):
+    """The ring-3 programs the build produces, and where they end up."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.result = myos_build.build(arch=32)
+        cls.volume = myfs.volume_from_image(cls.result.hard_disk, myfs.PARTITION_INDEX)
+
+    def test_every_program_in_the_build_is_in_the_volume(self) -> None:
+        self.assertEqual(sorted(self.result.users), ["badwrite", "hello", "hellocpp"])
+        for name, path in self.result.users.items():
+            packed = self.volume.read_file(self.volume.resolve(f"/bin/{name}"))
+            self.assertEqual(packed, path.read_bytes(),
+                             f"/bin/{name} in the volume is not the image the build made")
+
+    def test_every_image_has_a_header_the_kernel_will_accept(self) -> None:
+        # The rules the kernel applies (kernel32/user.cpp): the MYOS magic, architecture
+        # 3, a header whose bytes sum to zero, and an entry offset and size inside the
+        # image.  A program that fails any of these is refused at run time, so catching
+        # it here is the difference between a build failure and a surprise.
+        for name, path in self.result.users.items():
+            image = path.read_bytes()
+            self.assertEqual(image[:4], b"MYOS", name)
+            self.assertEqual(image[4], 3, f"{name} must say it is a user program")
+            self.assertEqual(image[6], 0, f"{name} must have zero flags")
+            self.assertEqual(sum(image[:16]) & 0xFF, 0, f"{name} header checksum")
+            entry = int.from_bytes(image[8:12], "little")
+            size = int.from_bytes(image[12:16], "little")
+            self.assertEqual(size, len(image), name)
+            self.assertGreaterEqual(entry, 16)
+            self.assertLess(entry, size)
+
+    def test_the_kernel_image_is_not_a_user_image(self) -> None:
+        # Same magic, different architecture byte: this is what keeps the two loaders
+        # from accepting each other's images.
+        kernel = self.result.kernel.read_bytes()
+        self.assertEqual(kernel[:4], b"MYOS")
+        self.assertEqual(kernel[4], 2)
+        self.assertEqual(self.result.users["hello"].read_bytes()[4], 3)
+
+    def test_the_manifest_covers_the_programs(self) -> None:
+        manifest = self.volume.read_file(self.volume.resolve("/manifest")).decode()
+        listed = {line.split()[0] for line in manifest.splitlines()}
+        for name in self.result.users:
+            self.assertIn(f"bin/{name}", listed)
+        # Three files from files/ plus three programs.
+        self.assertEqual(len(listed), 6)
+
+    def test_the_16_bit_build_has_no_user_programs(self) -> None:
+        # Ring 3 is a 32-bit kernel feature; the 16-bit image and its bundle are
+        # unchanged by it.
+        result = myos_build.build(arch=16)
+        self.assertEqual(result.users, {})
+        self.assertIsNone(result.volume)
+
+
+class PutFileTests(unittest.TestCase):
+    """Writing one more file into a volume that already exists.
+
+    This is the operation that makes a data disk able to receive new build output
+    without being rebuilt: `put_file` creates the directory it needs and replaces the
+    name it is given, and touches nothing else.
+    """
+
+    def test_it_creates_the_directory_it_needs(self) -> None:
+        volume = myfs.build_volume(ROOT / "files")
+        volume.put_file("/bin/tools/hello", b"program bytes")
+        self.assertEqual(volume.read_file(volume.resolve("/bin/tools/hello")),
+                         b"program bytes")
+        self.assertTrue(volume.resolve("/bin").is_dir)
+        self.assertEqual(volume.check(), [])
+
+    def test_it_replaces_a_file_in_place(self) -> None:
+        volume = myfs.build_volume(ROOT / "files")
+        before = volume.free_blocks
+        volume.put_file("/bin/hello", b"first version")
+        after_first = volume.free_blocks
+        volume.put_file("/bin/hello", b"second version")
+        self.assertEqual(volume.read_file(volume.resolve("/bin/hello")),
+                         b"second version")
+        self.assertLessEqual(after_first, before)
+        self.assertEqual(volume.check(), [])
+
+    def test_it_refuses_to_replace_a_directory(self) -> None:
+        volume = myfs.build_volume(ROOT / "files")
+        with self.assertRaises(myfs.MyfsError):
+            volume.put_file("/docs", b"not a directory")
+
+    def test_the_command_line_can_put_a_file_into_a_disk_image(self) -> None:
+        with scratch_directory() as directory:
+            disk = directory / "put.img"
+            myfs.write_data_disk(disk, files_dir=ROOT / "files")
+            source = directory / "hello.bin"
+            source.write_bytes(b"MYOS" + bytes(12))
+            self.assertEqual(myfs.main(["--image", str(disk), "--partition", "1",
+                                        "--put", "/bin/hello",
+                                        "--from", str(source)]), 0)
+            volume = myfs.volume_from_image(disk, myfs.PARTITION_INDEX)
+            self.assertEqual(volume.read_file(volume.resolve("/bin/hello")),
+                             b"MYOS" + bytes(12))
+            # The files that were already there are still there.
+            self.assertEqual(volume.read_file(volume.resolve("/hello.txt")),
+                             (ROOT / "files" / "hello.txt").read_bytes())
+            self.assertEqual(volume.check(), [])
+
+
+class DataDiskUpdateTests(unittest.TestCase):
+    """`build.py data-disk --update`: a merge, not a rebuild."""
+
+    def setUp(self) -> None:
+        self.original = myos_build.DATA_DISK
+
+    def tearDown(self) -> None:
+        myos_build.DATA_DISK = self.original
+
+    def test_it_adds_what_the_build_ships_and_keeps_the_rest(self) -> None:
+        with scratch_directory() as directory:
+            disk = directory / "update.img"
+            volume = myfs.build_volume(ROOT / "files")
+            volume.create_file("/note.txt", b"mine")          # the user's own file
+            disk.write_bytes(myfs.build_disk_image(volume))
+            myos_build.DATA_DISK = disk
+
+            self.assertEqual(myos_build.main(["data-disk", "--update"]), 0)
+
+            after = myfs.volume_from_image(disk, myfs.PARTITION_INDEX)
+            self.assertEqual(after.read_file(after.resolve("/note.txt")), b"mine")
+            for name, path in myos_build.build_users(myos_build_toolchain()).items():
+                self.assertEqual(after.read_file(after.resolve(f"/bin/{name}")),
+                                 path.read_bytes())
+            self.assertEqual(after.check(), [])
+
+    def test_updating_twice_is_the_same_as_updating_once(self) -> None:
+        with scratch_directory() as directory:
+            disk = directory / "twice.img"
+            myfs.write_data_disk(disk, files_dir=ROOT / "files")
+            myos_build.DATA_DISK = disk
+            self.assertEqual(myos_build.main(["data-disk", "--update"]), 0)
+            once = disk.read_bytes()
+            self.assertEqual(myos_build.main(["data-disk", "--update"]), 0)
+            twice = disk.read_bytes()
+            first = myfs.volume_from_image(disk, myfs.PARTITION_INDEX)
+            self.assertEqual(first.check(), [])
+            self.assertEqual(len(once), len(twice))
+            # `run` in the guest checks the manifest of whatever is on the volume, so a
+            # merge that rewrote files differently each time would be a boot-time
+            # failure rather than a cosmetic difference.
+            self.assertEqual(first.read_file(first.resolve("/manifest")),
+                             myfs.volume_from_image(disk, myfs.PARTITION_INDEX)
+                                 .read_file(myfs.volume_from_image(
+                                     disk, myfs.PARTITION_INDEX).resolve("/manifest")))
+
+    def test_a_disk_without_programs_is_kept_as_it_is(self) -> None:
+        # `data-disk` on its own still never rebuilds: only `--update` writes.
+        with scratch_directory() as directory:
+            disk = directory / "kept.img"
+            volume = myfs.build_volume(ROOT / "files")
+            volume.create_file("/note.txt", b"mine")
+            disk.write_bytes(myfs.build_disk_image(volume))
+            myos_build.DATA_DISK = disk
+            before = disk.read_bytes()
+            self.assertEqual(myos_build.main(["data-disk"]), 0)
+            self.assertEqual(disk.read_bytes(), before)
+
+
+def myos_build_toolchain():
+    """The toolchain the build uses, for tests that call into build.py's internals."""
+    from tools import toolchain
+    return toolchain.discover()
+
+
 @contextlib.contextmanager
 def scratch_directory():
     """A scratch directory under build/tmp, deliberately left behind.

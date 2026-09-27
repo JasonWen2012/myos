@@ -709,6 +709,40 @@ class Volume:
         self.dir_remove(parent, parts[-1])
         self.release_inode(child.index)
 
+    def put_file(self, path: str, data: bytes) -> Inode:
+        """Create or replace a file, making any missing parent directory first.
+
+        This is the `mkdir -p`-then-write shape, and it exists for one job: putting a
+        freshly built program into a volume that was created before the program did.
+        The user's own disk is never rebuilt -- that is what keeps their files -- so
+        the only way new build output reaches it is by naming it and writing it.
+        """
+        parts = _split_path(path)
+        if not parts:
+            raise MyfsError("a file needs a name")
+        # Walk the parents, creating each one that is missing.
+        prefix: list[str] = []
+        current = self.read_inode(self._read_super()["root_inode"])
+        for part in parts[:-1]:
+            prefix.append(part)
+            try:
+                child_index = self.lookup(current, part)
+            except MyfsError:
+                child_index = self.make_directory("/".join(prefix)).index
+            current = self.read_inode(child_index)
+            if not current.is_dir:
+                raise MyfsError(f"{part!r} is not a directory")
+
+        try:
+            existing = self.read_inode(self.lookup(current, parts[-1]))
+        except MyfsError:
+            return self.create_file(path, data)
+        if existing.is_dir:
+            raise MyfsError(f"{parts[-1]!r} is a directory")
+        self.truncate_file(existing)
+        self.write_file(existing, data)
+        return existing
+
     # -------------------------------------------------------------- traversal
 
     def iter_files(self) -> Iterator[tuple[str, Inode]]:
@@ -1003,6 +1037,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     source.add_argument("--create-data-disk", metavar="FILE",
                         help="write a whole disk holding one fresh myfs partition")
 
+    parser.add_argument("--put", metavar="NAME",
+                        help="copy --from into an existing volume at this path, "
+                             "creating the directory it lives in if needed")
+
     parser.add_argument("--partition", type=int, default=PARTITION_INDEX,
                         help=f"partition index inside --image "
                              f"(default {PARTITION_INDEX})")
@@ -1015,6 +1053,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--label", default=DEFAULT_LABEL, help="volume label")
     parser.add_argument("--files", metavar="DIR",
                         help="directory tree to pack into --create-data-disk")
+    parser.add_argument("--from", dest="source_file", metavar="FILE",
+                        help="the host file --put copies from")
     parser.add_argument("--blocks", type=int, default=BLOCK_COUNT,
                         help=f"block count for --build (default {BLOCK_COUNT})")
     parser.add_argument("--leak-blocks", type=int, default=0, metavar="N",
@@ -1046,6 +1086,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"wrote {args.create_data_disk}: myfs in partition "
                   f"{PARTITION_INDEX} at LBA {PARTITION_LBA}, {volume.block_count} "
                   f"blocks, {volume.free_inodes} free inodes")
+            return 0
+
+        if args.put is not None:
+            # A whole disk (--image) or a bare volume (--volume), and the write goes
+            # back into the same file it was read from: this is the "put one more file
+            # into the disk I already have" operation, and it must not disturb the
+            # files that are already in there.
+            if args.source_file is None:
+                parser.error("--put needs --from")
+            if args.volume is not None:
+                path = Path(args.volume)
+                volume = Volume(path.read_bytes())
+                if not args.put.startswith("/"):
+                    parser.error("--put takes a path inside the volume, like /bin/hello")
+                inode = volume.put_file(args.put, Path(args.source_file).read_bytes())
+                path.write_bytes(volume.to_bytes())
+                print(f"put {args.source_file} -> {args.put} ({inode.size} bytes) in "
+                      f"{path}")
+                return 0
+            path = Path(args.image)
+            volume = volume_from_image(path, args.partition)
+            if not args.put.startswith("/"):
+                parser.error("--put takes a path inside the volume, like /bin/hello")
+            inode = volume.put_file(args.put, Path(args.source_file).read_bytes())
+            path.write_bytes(build_disk_image(volume))
+            print(f"put {args.source_file} -> {args.put} ({inode.size} bytes) in "
+                  f"partition {args.partition} of {path}")
             return 0
 
         volume = _open_source(args)

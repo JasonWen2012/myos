@@ -49,6 +49,11 @@ void idt_read_loaded(IdtPointer* out);
 // The kernel's IDT: its linear address and its size in bytes.
 uint32 idt_address();
 uint32 idt_size();
+// A gate's descriptor privilege level and present bit, read from the table the
+// kernel built: the self-test's way of asking "can ring 3 actually use int 0x80?"
+// rather than "did we pass the right flags to the function that built it?".
+uint8 idt_gate_dpl(uint8 vector);
+bool idt_gate_present(uint8 vector);
 
 // A device driver registers what to run when its IRQ arrives; the dispatcher
 // knows nothing about timers or keyboards, which is what keeps it short enough to

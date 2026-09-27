@@ -7,7 +7,7 @@ An x86 operating system written from scratch, running two kernels on top of its 
 | | 16-bit kernel | 32-bit kernel |
 |---|---|---|
 | How it runs | Real mode, runs in the project's own emulator | Protected mode, C++ (`g++ -m32`), runs in QEMU |
-| What it can do now | Boot, type, command line | All of the above + interrupts/timer/serial + **its own hard disk driver and file system** |
+| What it can do now | Boot, type, command line | All of the above + interrupts/timer/serial + **its own hard disk driver and file system** + **multiple tasks with a preemptive round-robin scheduler** |
 | Can it store files | No | Yes, and they survive a reboot (stored in `data/myfs-data.img`) |
 
 Want to just play with it: **skip to [5-minute quick start](#5-minute-quick-start)**. Want to first know "what is this, and why was it written this way", see
@@ -56,6 +56,11 @@ cat /readme.txt
 write /note.txt hello myos
 cat /note.txt
 df
+run /bin/hello              ← a program running in ring 3, with its own address space
+run /bin/badwrite           ← and one that tries to read kernel memory: exit code 37
+schedtest                   ← two tasks, preempted by the timer, then reaped
+ps                          ← the task table
+dmesg                       ← what the kernel logged on the way
 reboot                      ← marks the volume clean before shutting down
 ```
 
@@ -112,7 +117,13 @@ python build.py doctor                :: report toolchain detection results (whe
 |---|---|
 | `help` `echo` `clear` `mem` `ticks` `fact` `keylog` `reboot` | Same as the 16-bit kernel |
 | `info` | Version, image/entry address, GDT/IDT, PIC vectors, boot drive number |
-| `selftest` | Run the kernel self-test (28 items) and **report the result via exit code**; tests rely on this |
+| `vm` | Physical pages, page tables, identity map and the heap (`vm fault` tests the panic path) |
+| `run <path>` | Run a program from the volume in ring 3 (`run /bin/hello`) |
+| `ps` | The task table: pid, state, CPU ticks, times switched to, page directory |
+| `schedtest` | Create two tasks, let the timer preempt them, then reap them |
+| `check` | Run the in-guest checks and stay in the shell |
+| `dmesg` | The kernel's own log, oldest first |
+| `selftest` | Run the kernel self-test (68 items) and **report the result via exit code**; tests rely on this |
 
 ### 32-bit kernel: disk and files
 
@@ -132,6 +143,30 @@ python build.py doctor                :: report toolchain detection results (whe
 | `fsck` | Scan the whole volume: reclaim leaked blocks, fix free counts, clear the dirty flag |
 | `fstest` | The kernel's own write-path self-test (22 items), restores the volume to its original state afterward |
 
+### 32-bit kernel: ring 3 and the programs in /bin
+
+The volume ships three programs (built from `user/` at build time), and `run` starts one of
+them in ring 3 — a real user program, on its own pages, which cannot reach kernel memory:
+
+```
+myos> run /bin/hello
+run: /bin/hello, 72 bytes at 40000000, stack 40104000, entry offset 00000010
+hello from ring 3
+run: /bin/hello exited with code 0
+run: 5 page(s) of user address space, 2 syscall(s)
+myos> run /bin/badwrite          ← asks the kernel to print 8 bytes of kernel memory
+run: /bin/badwrite exited with code 37     ← 37 = E_FAULT: refused, nothing leaked
+myos> run /bin/hellocpp
+hello from a C++ user program
+getpid() in user mode returned 1
+run: /bin/hellocpp exited with code 0
+```
+
+The contract those programs are written against — syscall numbers, registers, error codes, the
+user address window and the user-image format — is in [`docs/abi.md`](docs/abi.md). A program is
+refused before a single page of it is mapped unless its header checks out, and the kernel's own
+manifest check catches a corrupted file independently of that.
+
 A real session looks roughly like this:
 
 ```
@@ -149,6 +184,49 @@ df: 2048 blocks of 512 bytes: 7 used, 2035 free
 df: 64 inodes: 7 used, 56 free
 ```
 
+### 32-bit kernel: more than one thing running
+
+The kernel has a task table now, and a round-robin scheduler driven by the timer. `schedtest`
+creates two tasks that never yield — each one spins until the timer has taken the CPU away from it
+and given it back twice — so the lines below can only appear if preemption really happens:
+
+```
+myos> schedtest
+schedtest: creating two tasks and letting the timer preempt them
+  ok   the boot context is task 0, it is running, and it is alone
+  ok   each new task gets a pid of its own
+  ok   a new task is not yet runnable and runs in a page directory of its own
+  ok   a new task's kernel stack is heap memory with its canary in place
+sched: alpha round 1 (ticks 0)
+sched: beta round 1 (ticks 0)
+sched: alpha round 2 (ticks 2)
+sched: beta round 2 (ticks 2)
+  ok   a task's exit code reaches the task that created it
+  ok   the interrupt flag survives being switched away and back
+  ok   the timer charged CPU time to every runnable task
+  ok   the round robin switched into every task
+  ok   neither task overran its kernel stack
+  ok   reaping both tasks gives their stacks back to the heap
+  ok   the TSS and CR3 name the task that is running
+schedtest: 11 ok, 0 skipped, 0 failed
+schedtest: every task ran, exited, and gave its stack back
+myos> ps
+ps: 1 task(s) in the table, 4 created, 4 reaped, 17 switch(es)
+ps: pid state ticks switches parent name
+ps: 0 running 130 6 none kmain
+sched: 17 switch(es), 146 tick(s) charged, quantum 2 tick(s)
+sched: current pid 0 (kmain), preemption on
+```
+
+What each task owns: a pid, a state (`new` → `ready` → `running` → `zombie`), an 8 KiB kernel
+stack with a canary at the bottom, its own page directory (the kernel's mappings are shared, the
+directory is not, so a task can have private pages later), and the two registers that have to
+follow it — `CR3` and the TSS's `esp0`.
+
+What does **not** exist yet: `fork`, copy-on-write, signals, pipes, per-process file descriptors,
+and user programs as tasks. `run` still executes a ring-3 program synchronously on behalf of the
+task that called it. Those are the next milestone; see [`docs/roadmap.md`](docs/roadmap.md).
+
 ---
 
 ## Where files are actually stored
@@ -160,6 +238,18 @@ df: 64 inodes: 7 used, 56 free
 | `data/myfs-data.img` | **Your own disk**, what `run.py --arch 32` mounts | **Never** overwritten by the build |
 
 So: if you want to keep something, write it on the `data/` disk (that is, in the guest, `write` to `/`). The files in `files/` are sample files "shipped with the firmware"; `build.py clean` only deletes `build/` and `images/*.img`, and won't touch `data/`.
+
+That "never overwritten" promise has one consequence worth knowing before it surprises you: **a data disk made by an older build does not have things later builds started shipping** — the ring-3 programs in `/bin`, for instance. `run /bin/hello` then answers `no such file or directory`. The fix is a *merge*, not a rebuild:
+
+```bat
+python build.py data-disk --update    :: add files/ and /bin programs; your own files stay
+```
+
+Every name the build owns is created or replaced, and nothing else on the disk is touched — so a note you wrote in the guest survives. `run.py` says so too: when it mounts a data disk with no `/bin`, it prints the hint before starting QEMU. To put a single file in by hand:
+
+```bat
+python tools/myfs.py --image data/myfs-data.img --partition 1 --put /bin/hello --from build/user/hello
+```
 
 Volume specifications (`myfs` format):
 
@@ -174,11 +264,12 @@ Volume specifications (`myfs` format):
 ```
 boot/          Bootloader: boot16.asm (512-byte boot sector) + stage2.asm (loads the kernel)
 kernel16/      16-bit kernel (pure assembly: console, keyboard, shell)
-kernel32/      32-bit kernel (C++: GDT/IDT/PIC/PIT, keyboard, serial, ATA driver, myfs, shell)
+kernel32/      32-bit kernel (C++: GDT/IDT/PIC/PIT, keyboard, serial, ATA driver, myfs, tasks/scheduler, shell)
 emulator/      Project's own 16-bit x86 emulator + BIOS + VGA text rendering (the 16-bit kernel is validated with it)
 tools/         cofllink.py project's own linker, myfs.py file system tool, qemu.py test backend, image.py images
-files/         Example files: packaged into the myfs volume at build time, and a /manifest checksum list is generated
-tests/         Regression tests (194)
+files/         Example files: packaged into the myfs volume at build time, plus a /manifest checksum list
+user/          Ring-3 programs (header.asm + assembly and C++ sources); built into /bin of that volume
+tests/         Regression tests (238)
 build.py       Build: assemble + link + package images; also creates your data disk
 run.py         Run images: automatically chooses the backend based on the image header (16-bit→emulator, 32-bit→QEMU)
 memmap.py      Print memory/disk layout, all numbers measured from source and artifacts
@@ -191,6 +282,7 @@ docs/design.md Design and pitfalls record (read this if you want to go deeper)
 python build.py all                     :: 16-bit: boot sector + stage2 + kernel + floppy/hard disk images
 python build.py all --arch 32           :: 32-bit: same as above, plus the myfs volume and a 2 MiB hard disk image
 python build.py data-disk               :: create data/myfs-data.img (won't rebuild if it already exists)
+python build.py data-disk --update      :: merge files/ and /bin programs into it; your own files stay
 python build.py doctor                  :: toolchain detection
 python build.py clean                   :: clean build/ and images/*.img (doesn't touch data/)
 
@@ -204,13 +296,14 @@ python memmap.py --arch 32 --image       :: disk layout
 python memmap.py --live                  :: 16-bit runtime memory snapshot
 python tools/myfs.py --image data/myfs-data.img --partition 1 --list
 python tools/myfs.py --image data/myfs-data.img --partition 1 --extract /note.txt --out note.txt
+python tools/myfs.py --image data/myfs-data.img --partition 1 --put /bin/hello --from build/user/hello
 python tools/myfs.py --image data/myfs-data.img --partition 1 --check
 ```
 
 ## Tests: how do you know it isn't broken
 
 ```bat
-python -m unittest discover -s tests          :: all (194)
+python -m unittest discover -s tests          :: all (238)
 python -m unittest discover -s tests -v       :: with each test case name
 python -m unittest tests.test_kernel32 -v     :: only the 32-bit group
 python -m unittest tests.test_myfs            :: only the file system format group
@@ -247,6 +340,15 @@ The 16-bit works as usual (project's own emulator). The 32-bit will report that 
 **`ls` says "no filesystem mounted"?**
 This happens when no disk is mounted; the reason is in parentheses (`no ATA device on the primary channel` = this boot didn't attach a hard disk to the guest). Starting with `run.py --arch 32` will automatically mount `data/myfs-data.img`.
 
+**`run /bin/hello` says "no such file or directory"?**
+Your data disk was made before the build started shipping programs in `/bin` — and a data disk is never rebuilt, which is what keeps your own files. Merge them in:
+
+```bat
+python build.py data-disk --update
+```
+
+It creates or replaces only the names the build owns (`files/` and `/bin/*`) and leaves everything else, including files you wrote in the guest, exactly as it was. `run.py` prints a hint when the disk it is about to mount has no `/bin`. If you would rather look at the build's own disk, boot with `--no-build` after building: `images/myos32-hd.img` has the programs already.
+
 **Why can't `..` be used?**
 The format doesn't store a parent pointer, so returning "not supported" is more honest than guessing a directory.
 
@@ -258,12 +360,12 @@ See the [glossary in `docs/design.md`](docs/design.md#术语表).
 --arch 32`; run the tests once to confirm you didn't step on anything else.
 
 **How big is the 32-bit kernel, and how much room is left?**
-The bootloader reserves 896 sectors (448 KiB) for the kernel; about 160 sectors are used now. `build.py` will fail the build directly when the budget is exceeded, rather than producing a broken image.
+The bootloader reserves 896 sectors (448 KiB) for the kernel; about 224 sectors are used now. `build.py` will fail the build directly when the budget is exceeded, rather than producing a broken image.
 
 ## What doesn't exist yet
 
-Paging and heap (`kmalloc`), processes/threads, user mode and system calls, multiple disks, timestamps and permissions, append writes,
-files larger than 136704 bytes, Chinese input, and 64-bit (there's no plan for that right now). The complete design rationale and all the pitfalls encountered along the way are in [`docs/design.md`](docs/design.md).
+`fork`/copy-on-write, signals, pipes, user programs as their own tasks (a `run` program still executes synchronously on behalf of whoever called it), multiple disks, timestamps and permissions, append writes, files larger than 136704 bytes, Chinese input, and 64-bit (there's no plan for that right now). Paging, a kernel heap, user mode with system calls, **and a preemptive round-robin scheduler** do exist now — `vm` reports the first two, `run` uses the third, `ps` shows the scheduler's task table, and `docs/roadmap.md` has what comes next. The complete design rationale and all the pitfalls encountered along the way are in [`docs/design.md`](docs/design.md),
+and the seven-phase plan for the rest of it — what each phase delivers, how it is validated, and what it deliberately does not do — is in [`docs/roadmap.md`](docs/roadmap.md) (Chinese, like the design notes).
 
 ## Environment requirements
 

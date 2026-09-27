@@ -44,4 +44,20 @@ static inline void interrupts_disable(void) {
     asm volatile("cli");
 }
 
+// The interrupt flag as part of a saved context.  The scheduler needs both halves:
+// it reads EFLAGS before it disables interrupts and writes the same value back when
+// the task is resumed, so that a task parked in a voluntary yield comes back with
+// interrupts on and one parked inside an interrupt handler comes back with them off
+// (its own `iret` restores them from the frame).  Saving the flag inside switch_to
+// instead would be too late: by then `cli` has already cleared it.
+static inline uint32 read_eflags(void) {
+    uint32 value;
+    asm volatile("pushfl; popl %0" : "=r"(value));
+    return value;
+}
+
+static inline void write_eflags(uint32 value) {
+    asm volatile("pushl %0; popfl" : : "r"(value) : "memory");
+}
+
 }  // namespace myos

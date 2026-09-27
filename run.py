@@ -292,11 +292,24 @@ def ensure_data_disk() -> Path:
     those, and a rebuild that deletes what you saved is not a filesystem.
     """
     disk = myos_build.DATA_DISK
-    if disk.is_file():
+    if not disk.is_file():
+        volume = myfs.write_data_disk(disk, files_dir=myos_build.FILES_DIR)
+        print(f"created {disk} ({disk.stat().st_size} bytes, "
+              f"{volume.free_blocks} free blocks) -- your files live here")
         return disk
-    volume = myfs.write_data_disk(disk, files_dir=myos_build.FILES_DIR)
-    print(f"created {disk} ({disk.stat().st_size} bytes, "
-          f"{volume.free_blocks} free blocks) -- your files live here")
+    # A disk created before a build started shipping something new will not have it,
+    # and the guest's answer is "no such file or directory" with no hint why.  Saying
+    # so here costs one listing and answers the question where it gets asked.
+    try:
+        volume = myfs.volume_from_image(disk, myfs.PARTITION_INDEX)
+        programs = [path for path, inode in volume.iter_files()
+                    if path.startswith("bin/") and inode.is_file]
+    except (myfs.MyfsError, OSError):
+        return disk
+    if not programs:
+        print(f"note: {disk} has no programs in /bin, so `run /bin/hello` will say "
+              "there is no such file; `python build.py data-disk --update` adds them "
+              "without touching your own files")
     return disk
 
 

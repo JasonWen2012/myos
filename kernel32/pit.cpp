@@ -5,6 +5,7 @@
 #include "idt.h"
 #include "io.h"
 #include "pic.h"
+#include "sched.h"
 #include "types.h"
 
 namespace myos {
@@ -16,6 +17,10 @@ volatile uint64 tick_count = 0;
 
 void handle_tick() {
     ++tick_count;
+    // The timer's other job: it is the only thing that can take the CPU away from a
+    // task that does not want to give it up.  sched_tick() only counts and switches --
+    // it runs in interrupt context, where nothing may block and nothing may allocate.
+    sched_tick();
 }
 
 }  // namespace

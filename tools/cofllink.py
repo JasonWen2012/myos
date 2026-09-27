@@ -268,6 +268,31 @@ def kernel_layout() -> list[SectionPlacement]:
     ]
 
 
+def user_layout() -> list[SectionPlacement]:
+    """Layout for a ring-3 program: header, code, rodata, data, bss.
+
+    The same shape as the kernel's, minus the kernel's own stack: a user program's
+    stack is mapped by the kernel before it is entered, and a `.bss.stack` in the
+    image would just be a pile of zeroes the kernel also has to copy.
+
+    The header region is what makes a user image loadable at all -- the kernel reads
+    its entry offset, size and checksum from offset 0 before it maps anything -- and it
+    is a section the program has to include (user/header.asm), rather than something
+    the linker synthesises.
+    """
+    return [
+        SectionPlacement("header", (".myos_header",), order=-1, align=16),
+        SectionPlacement("code", (".text*",), order=0, align=16, writable=False),
+        SectionPlacement("rodata", (".rdata*", ".rodata*"), order=1, align=4),
+        SectionPlacement("data", (".data*",), order=2, align=4, writable=True),
+        SectionPlacement("bss", (".bss", ".bss$*"), order=3, align=4, writable=True,
+                         zero_fill=True),
+        SectionPlacement("discard", (".debug*", ".eh_frame*", ".xdata*", ".pdata*",
+                                     ".drectve*", ".CRT*", ".gfids*", ".giats*"),
+                         order=99, discard=True),
+    ]
+
+
 def loader_layout() -> list[SectionPlacement]:
     """Layout for the 16-bit kernel.
 

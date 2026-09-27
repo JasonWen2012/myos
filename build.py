@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -42,11 +42,27 @@ KERNEL16_SOURCES = ("main.asm", "console.asm")
 # The 32-bit kernel grows one milestone at a time, so this list is what exists
 # now rather than what is planned: build_kernel32 refuses to build if a source is
 # missing, which is a clearer failure than a link error about a stub nobody wrote.
-KERNEL32_ASM_SOURCES = ("boot.asm", "isr.asm")
+KERNEL32_ASM_SOURCES = ("boot.asm", "isr.asm", "ring3.asm", "switch.asm")
 KERNEL32_CPP_SOURCES = ("kernel.cpp", "console.cpp", "libc.cpp", "gdt.cpp",
                         "idt.cpp", "pic.cpp", "pit.cpp", "keyboard.cpp",
                         "shell.cpp", "mem.cpp", "ata.cpp", "mbr.cpp", "fs.cpp",
-                        "file.cpp")
+                        "file.cpp", "pmm.cpp", "paging.cpp", "heap.cpp",
+                        "panic.cpp", "tss.cpp", "usercopy.cpp", "syscall.cpp",
+                        "user.cpp", "klog.cpp", "task.cpp", "sched.cpp")
+
+# Ring-3 programs.  Each entry is a name (which becomes /bin/<name> in the myfs
+# volume) and the sources that make it: user/header.asm is what gives the image its
+# loadable header, so every program links it.  The extension decides the compiler, so
+# a program can be assembly, C++, or both.
+USER_DIR = ROOT / "user"
+USER_BASE = 0x40000000              # matches USER_BASE in kernel32/usercopy.h
+USER_IMAGE_HEADER = 16
+USER_IMAGE_ARCH = 3                 # matches USER_IMAGE_ARCH in kernel32/user.h
+USER_PROGRAMS = (
+    ("hello", ("header.asm", "hello.asm")),
+    ("badwrite", ("header.asm", "badwrite.asm")),
+    ("hellocpp", ("header.asm", "hello.cpp")),
+)
 
 BOOT_STAGE1 = "boot16.asm"          # the 512-byte first stage
 BOOT_STAGE2 = "stage2.asm"          # the second stage it loads
@@ -92,6 +108,7 @@ class BuildResult:
     kernel_bytes: int
     sectors_read: int
     volume: Path | None = None          # the packed myfs volume, 32-bit images only
+    users: dict[str, Path] = field(default_factory=dict)   # /bin/<name> in that volume
 
 
 def _ensure_dirs() -> None:
@@ -268,6 +285,80 @@ def build_kernel16(tc: toolchain.Toolchain, out: Path,
     return kernel
 
 
+def build_user(tc: toolchain.Toolchain, name: str, sources: tuple[str, ...],
+               verbose: bool = False) -> bytes:
+    """Assemble, link and patch one ring-3 program.
+
+    The image is built the same way the kernel's is -- assemble, link with the in-tree
+    linker, patch the 16-byte header -- and differs in exactly three things: the base
+    address, the layout (no kernel stack section), and the architecture byte that tells
+    the kernel this is something to run in ring 3 rather than a kernel to boot.
+    """
+    objects = []
+    for source in sources:
+        path = USER_DIR / source
+        if not path.is_file():
+            raise BuildError(f"user/{source} is missing (needed by the {name} program)")
+        obj = BUILD_DIR / f"user-{name}-{Path(source).stem}.o"
+        if path.suffix == ".asm":
+            toolchain.assemble(path, obj, fmt="win32", include_dirs=[USER_DIR], tc=tc)
+        else:
+            toolchain.compile_cpp(path, obj, include_dirs=[USER_DIR], tc=tc)
+        objects.append(obj)
+    result = cofllink.link(objects, base=USER_BASE, entry="user_entry",
+                           layout=cofllink.user_layout(), verbose=verbose)
+    entry_address = cofllink.resolve_symbol(result.symbols, "user_entry")
+    if entry_address is None:
+        raise BuildError(f"{name} does not define user_entry")
+    entry_offset = entry_address - USER_BASE
+    image = cofllink.patch_image_header(result.image, entry_offset, USER_IMAGE_HEADER)
+    cofllink.verify_header(image, USER_IMAGE_HEADER, b"MYOS", arch=USER_IMAGE_ARCH)
+    # The kernel refuses an image bigger than USER_IMAGE_MAX, so catch it here where
+    # the message can say which program and by how much.
+    if len(image) > 256 * 1024:
+        raise BuildError(
+            f"{name} is {len(image)} bytes, past the 256 KiB a user image may be"
+        )
+    return image
+
+
+def build_users(tc: toolchain.Toolchain, verbose: bool = False) -> dict[str, Path]:
+    """Builds every ring-3 program and returns where each one landed."""
+    built: dict[str, Path] = {}
+    for name, sources in USER_PROGRAMS:
+        image = build_user(tc, name, sources, verbose=verbose)
+        path = BUILD_DIR / "user" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(image)
+        built[name] = path
+    return built
+
+
+def stage_volume_tree(users: dict[str, Path]) -> Path:
+    """Builds the directory tree that goes into the myfs volume.
+
+    `files/` as it is in the source tree, plus `/bin/<name>` for every ring-3 program.
+    Assembling it here rather than teaching the packer about several sources keeps
+    `tools/myfs.py` a description of the on-disk format and nothing else.
+    """
+    target = BUILD_DIR / "volume"
+    if target.exists():
+        for path in sorted(target.rglob("*"), reverse=True):
+            if path.is_file():
+                path.unlink()
+            else:
+                path.rmdir()
+    (target / "bin").mkdir(parents=True, exist_ok=True)
+    for source in sorted(FILES_DIR.rglob("*")):
+        if source.is_file():
+            destination = target / source.relative_to(FILES_DIR)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(source.read_bytes())
+    for name, image in sorted(users.items()):
+        (target / "bin" / name).write_bytes(image.read_bytes())
+    return target
+
+
 def build_kernel32(tc: toolchain.Toolchain, out: Path, verbose: bool = False) -> bytes:
     """Compile and link the 32-bit C++ kernel, then patch its image header.
 
@@ -296,6 +387,18 @@ def build_kernel32(tc: toolchain.Toolchain, out: Path, verbose: bool = False) ->
         toolchain.compile_cpp(KERNEL32_DIR / source, obj,
                               include_dirs=[KERNEL32_DIR], tc=tc)
         objects.append(obj)
+    # The object name comes from the file's stem, so two sources called `user.asm`
+    # and `user.cpp` would share one .o -- and the same object linked twice does not
+    # fail as a duplicate *file*: it links, into two different places, and the error
+    # that finally appears is "this static function is defined more than once at
+    # different addresses", which points at the function and not at the file names.
+    if len(set(objects)) != len(objects):
+        duplicates = sorted({path.name for path in objects
+                             if [p.name for p in objects].count(path.name) > 1})
+        raise BuildError(
+            "two kernel sources share one object name: " + ", ".join(duplicates)
+            + "; rename one of them so the stems differ"
+        )
     result = cofllink.link(objects, base=KERNEL32_BASE, entry="kernel_entry",
                            layout=cofllink.kernel_layout(), verbose=verbose)
     entry_address = cofllink.resolve_symbol(result.symbols, "kernel_entry")
@@ -357,7 +460,8 @@ def _verify_stub_table(image: bytes, symbols: dict) -> None:
 
 
 def pack_images(stage1: bytes, stage2: bytes, kernel: bytes,
-                arch: int = 16) -> tuple[Path, Path, Path | None]:
+                arch: int = 16,
+                volume_source: Path | None = None) -> tuple[Path, Path, Path | None]:
     """Write the floppy and MBR-partitioned hard disk images.
 
     Both media share one layout:
@@ -416,7 +520,8 @@ def pack_images(stage1: bytes, stage2: bytes, kernel: bytes,
                 f"{KERNEL_LBA + MAX_KERNEL32_SECTORS - 1}); move the partition or "
                 "shrink the kernel budget in boot/boot.inc"
             )
-        volume = myfs.build_volume(FILES_DIR)
+        source = volume_source if volume_source is not None else FILES_DIR
+        volume = myfs.build_volume(source)
         volume_path = IMAGES_DIR / "myfs-volume.img"
         volume_path.write_bytes(volume.to_bytes())
 
@@ -448,6 +553,53 @@ def pack_images(stage1: bytes, stage2: bytes, kernel: bytes,
     return floppy_path, hard_path, volume_path
 
 
+def bundled_entries(users: dict[str, Path]) -> list[tuple[str, bytes]]:
+    """Everything a build ships, as (path inside the volume, bytes).
+
+    `files/` plus the ring-3 programs.  This is the list a data disk is *updated*
+    with: naming what the build owns is what makes it possible to add to the user's
+    disk without guessing which of its files are theirs.
+    """
+    entries: list[tuple[str, bytes]] = []
+    for source in sorted(FILES_DIR.rglob("*")):
+        if source.is_file():
+            relative = source.relative_to(FILES_DIR).as_posix()
+            entries.append((f"/{relative}", source.read_bytes()))
+    for name, image in sorted(users.items()):
+        entries.append((f"/bin/{name}", image.read_bytes()))
+    return entries
+
+
+def update_data_disk(tc: toolchain.Toolchain) -> int:
+    """Add the files a build ships into the user's own disk, leaving the rest alone.
+
+    The data disk is never rebuilt -- that is the whole reason the user's files
+    survive a build -- so when a build starts shipping something new (the ring-3
+    programs, for instance) an older disk simply does not have it, and `run /bin/hello`
+    answers "no such file or directory".  This merges: every name the build owns is
+    created or replaced, and nothing else on the disk is touched.
+    """
+    users = build_users(tc)
+    if not DATA_DISK.exists():
+        volume = myfs.write_data_disk(DATA_DISK, files_dir=FILES_DIR)
+        print(f"wrote {DATA_DISK} ({DATA_DISK.stat().st_size} bytes, myfs in "
+              f"partition {myfs.PARTITION_INDEX} at LBA {myfs.PARTITION_LBA}, "
+              f"{volume.free_blocks} free blocks)")
+        return 0
+
+    volume = myfs.volume_from_image(DATA_DISK, myfs.PARTITION_INDEX)
+    before = {path for path, _ in volume.iter_files()}
+    for path, data in bundled_entries(users):
+        volume.put_file(path, data)
+    DATA_DISK.write_bytes(myfs.build_disk_image(volume))
+    after = {path for path, _ in volume.iter_files()}
+    print(f"updated {DATA_DISK}: {len(before & after)} entry/entries kept, "
+          f"{len(after - before)} added ({', '.join(sorted(after - before)) or 'none'}), "
+          f"{volume.free_blocks} free blocks")
+    print("(if QEMU has this disk open, close it before booting again)")
+    return 0
+
+
 def build(arch: int = 16, verbose: bool = False) -> BuildResult:
     _ensure_dirs()
     tc = toolchain.discover()
@@ -459,12 +611,18 @@ def build(arch: int = 16, verbose: bool = False) -> BuildResult:
     stage1 = build_stage1(tc, stage1_out)
     stage2 = build_stage2(tc, stage2_out)
 
+    users: dict[str, Path] = {}
+    volume_source: Path | None = None
     if arch == 16:
         kernel = build_kernel16(tc, BUILD_DIR / "kernel16.bin", verbose=verbose)
         budget = MAX_KERNEL_SECTORS
     else:
         kernel = build_kernel32(tc, BUILD_DIR / "kernel32.bin", verbose=verbose)
         budget = MAX_KERNEL32_SECTORS
+        # The ring-3 programs are built and packed next to the files the source tree
+        # ships: same volume, same manifest, same check on every boot.
+        users = build_users(tc, verbose=verbose)
+        volume_source = stage_volume_tree(users)
 
     if len(kernel) > budget * image.SECTOR:
         where = ("MAX_KERNEL_SECTORS in both build.py and boot/boot.inc"
@@ -476,11 +634,12 @@ def build(arch: int = 16, verbose: bool = False) -> BuildResult:
             "or shrink the kernel"
         )
 
-    floppy, hard, volume = pack_images(stage1, stage2, kernel, arch)
+    floppy, hard, volume = pack_images(stage1, stage2, kernel, arch, volume_source)
     return BuildResult(boot=stage1_out, stage2=stage2_out,
                        kernel=BUILD_DIR / f"kernel{arch}.bin", floppy=floppy,
                        hard_disk=hard, kernel_bytes=len(kernel),
-                       sectors_read=image.kernel_sectors(kernel), volume=volume)
+                       sectors_read=image.kernel_sectors(kernel), volume=volume,
+                       users=users)
 
 
 def doctor() -> int:
@@ -496,6 +655,10 @@ def main(argv: list[str] | None = None) -> int:
                                  "data-disk", "doctor", "clean"))
     parser.add_argument("--arch", type=int, default=16, choices=(16, 32))
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--update", action="store_true",
+                        help="with `data-disk`: merge the files a build ships "
+                             "(files/ and /bin programs) into the existing disk, "
+                             "leaving everything else on it alone")
     args = parser.parse_args(argv)
 
     if args.command == "doctor":
@@ -503,11 +666,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "data-disk":
         # The user's own disk, created once and then never rebuilt: `run.py` boots
         # the floppy and hangs this off the ATA controller, so what the kernel
-        # writes here survives both a reboot and a `build.py all`.
+        # writes here survives both a reboot and a `build.py all`.  `--update` is the
+        # one way build output reaches it, and it names exactly what it replaces.
+        if args.update:
+            return update_data_disk(toolchain.discover())
         if DATA_DISK.exists():
             volume = myfs.volume_from_image(DATA_DISK, myfs.PARTITION_INDEX)
             print(f"kept {DATA_DISK} (already exists, "
                   f"{volume.free_blocks} free blocks)")
+            print("(use `build.py data-disk --update` to merge the files a build "
+                  "ships into it, such as /bin programs)")
             return 0
         volume = myfs.write_data_disk(DATA_DISK, files_dir=FILES_DIR)
         print(f"wrote {DATA_DISK} ({DATA_DISK.stat().st_size} bytes, myfs in "
@@ -536,9 +704,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"disk image  : {result.hard_disk} ({result.hard_disk.stat().st_size} bytes)")
     if result.volume is not None:
         packed = len(list(myfs.Volume(result.volume.read_bytes()).iter_files()))
+        programs = ", ".join(sorted(result.users)) if result.users else "none"
         print(f"volume      : {result.volume} "
-              f"({result.volume.stat().st_size} bytes, {packed} entries packed from "
-              f"{FILES_DIR})")
+              f"({result.volume.stat().st_size} bytes, {packed} entries: {FILES_DIR} "
+              f"plus /bin programs [{programs}])")
     return 0
 
 

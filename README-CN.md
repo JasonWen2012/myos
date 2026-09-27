@@ -7,7 +7,7 @@
 | | 16 位内核 | 32 位内核 |
 |---|---|---|
 | 运行方式 | 实模式，自研模拟器就能跑 | 保护模式，C++（`g++ -m32`），用 QEMU 跑 |
-| 现在能做什么 | 引导、打字、命令行 | 上面这些 + 中断/定时器/串口 + **自己的硬盘驱动和文件系统** |
+| 现在能做什么 | 引导、打字、命令行 | 上面这些 + 中断/定时器/串口 + **自己的硬盘驱动和文件系统** + **多任务和抢占式轮转调度** |
 | 能不能存文件 | 不能 | 能，重启后还在（存在 `data/myfs-data.img`） |
 
 想直接玩：**跳到 [5 分钟上手](#5-分钟上手)**。想先知道"这是什么、为什么这么写"，看
@@ -43,7 +43,7 @@ reboot
 
 ```bat
 python build.py all --arch 32
-python build.py data-disk
+python build.py data-disk --update
 python run.py --arch 32
 ```
 
@@ -57,6 +57,11 @@ cat /readme.txt
 write /note.txt hello myos
 cat /note.txt
 df
+run /bin/hello              ← 一个跑在 ring 3 里的程序，有自己独立的地址空间
+run /bin/badwrite           ← 它想读内核内存：退出码 37（E_FAULT，被拒绝）
+schedtest                   ← 建两个任务，让定时器把它们抢走再回收
+ps                          ← 任务表
+dmesg                       ← 内核这一路的日志
 reboot                      ← 关机前会自动把卷标记干净
 ```
 
@@ -115,7 +120,13 @@ python build.py doctor                :: 报告工具链探测结果（NASM/g++/
 |---|---|
 | `help` `echo` `clear` `mem` `ticks` `fact` `keylog` `reboot` | 和 16 位内核一样 |
 | `info` | 版本、镜像/入口地址、GDT/IDT、PIC 向量、引导盘号 |
-| `selftest` | 跑内核自检（28 项）并**用退出码报告结果**，测试靠它判定 |
+| `vm` | 物理页、页表、identity map 和内核堆（`vm fault` 用来验证崩溃报告路径） |
+| `run <路径>` | 在 ring 3 里跑卷里的程序（`run /bin/hello`）——真正的用户程序，有自己的地址空间，碰不到内核内存 |
+| `ps` | 任务表：pid、状态、拿到的 CPU tick 数、被切入次数、页目录 |
+| `schedtest` | 建两个任务，让定时器把它们的 CPU 抢走，跑完回收 |
+| `check` | 跑内核自检但**不结束会话**（留在 shell 里） |
+| `dmesg` | 内核自己的日志（启动里程碑、挂载、每一次进出 ring 3） |
+| `selftest` | 跑内核自检（68 项）并**用退出码报告结果**，测试靠它判定 |
 
 ### 32 位内核：磁盘和文件
 
@@ -135,6 +146,29 @@ python build.py doctor                :: 报告工具链探测结果（NASM/g++/
 | `fsck` | 扫描整个卷：回收漏块、修正空闲计数、清掉脏标记 |
 | `fstest` | 内核自己的写路径自检（22 项），跑完把卷恢复原样 |
 
+### 32 位内核：ring 3 和 /bin 里的程序
+
+构建时从 `user/` 编出三个程序塞进卷里，`run` 会把其中一个放进 ring 3 跑——它有自己的一套页，
+碰不到内核内存：
+
+```
+myos> run /bin/hello
+run: /bin/hello, 72 bytes at 40000000, stack 40104000, entry offset 00000010
+hello from ring 3
+run: /bin/hello exited with code 0
+run: 5 page(s) of user address space, 2 syscall(s)
+myos> run /bin/badwrite          ← 叫内核把 8 字节内核内存打印出来
+run: /bin/badwrite exited with code 37     ← 37 = E_FAULT：被拒绝，一个字节都没漏
+myos> run /bin/hellocpp
+hello from a C++ user program
+getpid() in user mode returned 1
+run: /bin/hellocpp exited with code 0
+```
+
+这些程序遵守的合同（调用号、寄存器、错误码、用户地址窗口、用户镜像格式）写在
+[`docs/abi.md`](docs/abi.md)。头部校验不过的程序**一页都不会被映射**；就算绕过去，内核自己的
+manifest 校验和也会发现文件被改过。
+
 一次真实的会话大概长这样：
 
 ```
@@ -152,6 +186,48 @@ df: 2048 blocks of 512 bytes: 7 used, 2035 free
 df: 64 inodes: 7 used, 56 free
 ```
 
+### 32 位内核：不止一个东西在跑
+
+内核现在有一张任务表，和一个由定时器驱动的轮转调度器。`schedtest` 建的两个任务**从不主动让出
+CPU**——每个都要转到定时器把 CPU 抢走、再还回来两次才继续——所以下面这几行只有真的发生了抢占
+才可能出现：
+
+```
+myos> schedtest
+schedtest: creating two tasks and letting the timer preempt them
+  ok   the boot context is task 0, it is running, and it is alone
+  ok   each new task gets a pid of its own
+  ok   a new task is not yet runnable and runs in a page directory of its own
+  ok   a new task's kernel stack is heap memory with its canary in place
+sched: alpha round 1 (ticks 0)
+sched: beta round 1 (ticks 0)
+sched: alpha round 2 (ticks 2)
+sched: beta round 2 (ticks 2)
+  ok   a task's exit code reaches the task that created it
+  ok   the interrupt flag survives being switched away and back
+  ok   the timer charged CPU time to every runnable task
+  ok   the round robin switched into every task
+  ok   neither task overran its kernel stack
+  ok   reaping both tasks gives their stacks back to the heap
+  ok   the TSS and CR3 name the task that is running
+schedtest: 11 ok, 0 skipped, 0 failed
+schedtest: every task ran, exited, and gave its stack back
+myos> ps
+ps: 1 task(s) in the table, 4 created, 4 reaped, 17 switch(es)
+ps: pid state ticks switches parent name
+ps: 0 running 130 6 none kmain
+sched: 17 switch(es), 146 tick(s) charged, quantum 2 tick(s)
+sched: current pid 0 (kmain), preemption on
+```
+
+每个任务自己的东西：pid、状态（`new` → `ready` → `running` → `zombie`）、一块 8 KiB 的
+内核栈（栈底有一个 canary）、《自己的页目录》（内核映射是共享的，目录不是，所以以后每个任务
+可以有私有页），以及两个必须跟着它走的东西——`CR3` 和 TSS 的 `esp0`。
+
+**还没有的**：`fork`、写时复制、信号、管道、每进程 fd 表、以及"用户程序就是一个任务"。
+`run` 目前仍然是"代替调用它的那个任务、同步地"跑一个 ring 3 程序。这些是下一个里程碑，
+见 [`docs/roadmap.md`](docs/roadmap.md)。
+
 ---
 
 ## 文件到底存在哪
@@ -166,6 +242,22 @@ df: 64 inodes: 7 used, 56 free
 的文件是"随固件发布"的示例文件；`build.py clean` 只删 `build/` 和 `images/*.img`，
 不会动 `data/`。
 
+"永远不覆盖"这条承诺有一个必然的后果，最好提前知道：**旧版本构建做出来的数据盘，不会有
+后来才加进构建产物的东西**——比如 `/bin` 里的 ring 3 程序。这时 `run /bin/hello` 会说
+`no such file or directory`。处理办法是**合并**，不是重建：
+
+```bat
+python build.py data-disk --update    :: 把 files/ 和 /bin 里的程序并进去，你自己的文件不动
+```
+
+构建"拥有"的每一个名字会被创建或替换，盘上其它东西一个都不碰——所以在 guest 里写的便签
+照样在。`run.py` 也会提醒：挂载的数据盘里没有 `/bin` 时，它在启动 QEMU 之前就把这句话打出来。
+只想手工塞一个文件：
+
+```bat
+python tools/myfs.py --image data/myfs-data.img --partition 1 --put /bin/hello --from build/user/hello
+```
+
 卷的规格（`myfs` 格式）：
 
 - 1 MiB = 2048 块 × 512 字节，64 个 inode。
@@ -179,11 +271,12 @@ df: 64 inodes: 7 used, 56 free
 ```
 boot/          引导器：boot16.asm（512 字节引导扇区）+ stage2.asm（加载内核）
 kernel16/      16 位内核（纯汇编：控制台、键盘、shell）
-kernel32/      32 位内核（C++：GDT/IDT/PIC/PIT、键盘、串口、ATA 驱动、myfs、shell）
+kernel32/      32 位内核（C++：GDT/IDT/PIC/PIT、键盘、串口、ATA 驱动、myfs、任务/调度、shell）
 emulator/      自研 16 位 x86 模拟器 + BIOS + VGA 文本渲染（16 位内核靠它验收）
 tools/         cofllink.py 自研链接器、myfs.py 文件系统工具、qemu.py 测试后端、image.py 镜像
 files/         例子文件：构建时打包进 myfs 卷，并生成 /manifest 校验清单
-tests/         回归测试（194 个）
+user/          ring 3 程序（header.asm + 汇编/C++ 源码），构建进同一个卷的 /bin 里
+tests/         回归测试（238 个）
 build.py       构建：汇编 + 链接 + 打包镜像；也负责创建你的数据盘
 run.py         运行镜像：按镜像头自动选后端（16 位→模拟器，32 位→QEMU）
 memmap.py      打印内存/磁盘布局，数字都从源码和产物里量出来
@@ -196,6 +289,7 @@ docs/design.md 设计与踩坑记录（想深入看这个）
 python build.py all                     :: 16 位：引导扇区 + stage2 + 内核 + 软盘/硬盘镜像
 python build.py all --arch 32           :: 32 位：同上，外加 myfs 卷和 2 MiB 硬盘镜像
 python build.py data-disk               :: 创建 data/myfs-data.img（已存在就不重建）
+python build.py data-disk --update      :: 把 files/ 和 /bin 的程序并进去，你自己的文件不动
 python build.py doctor                  :: 工具链探测
 python build.py clean                   :: 清掉 build/ 和 images/*.img（不动 data/）
 
@@ -209,13 +303,14 @@ python memmap.py --arch 32 --image       :: 磁盘布局
 python memmap.py --live                  :: 16 位运行时内存快照
 python tools/myfs.py --image data/myfs-data.img --partition 1 --list
 python tools/myfs.py --image data/myfs-data.img --partition 1 --extract /note.txt --out note.txt
+python tools/myfs.py --image data/myfs-data.img --partition 1 --put /bin/hello --from build/user/hello
 python tools/myfs.py --image data/myfs-data.img --partition 1 --check
 ```
 
 ## 测试：怎么知道它没坏
 
 ```bat
-python -m unittest discover -s tests          :: 全部（194 个）
+python -m unittest discover -s tests          :: 全部（238 个）
 python -m unittest discover -s tests -v       :: 带每条用例名
 python -m unittest tests.test_kernel32 -v     :: 只跑 32 位那组
 python -m unittest tests.test_myfs            :: 只跑文件系统格式那组
@@ -258,6 +353,18 @@ skip。装一个（Windows 版 QEMU，`qemu-system-i386.EXE` 在 `PATH` 或
 没挂上盘时会这样，括号里是原因（`no ATA device on the primary channel` = 这次启动没
 给 guest 挂硬盘）。用 `run.py --arch 32` 启动就会自动挂上 `data/myfs-data.img`。
 
+**`run /bin/hello` 说 no such file or directory？**
+你的数据盘是在"构建开始带 /bin 程序"之前做的——而数据盘永远不会被重建（这正是你的文件还在
+的原因）。把它并进去：
+
+```bat
+python build.py data-disk --update
+```
+
+它只创建或替换构建拥有的名字（`files/` 和 `/bin/*`），盘上其它东西——包括你在 guest 里写的
+文件——原样保留。`run.py` 发现要挂的盘里没有 `/bin` 时会先提示一句。想看构建自己的那块盘，
+构建完用 `--no-build` 跑：`images/myos32-hd.img` 里本来就有这些程序。
+
 **为什么 `..` 不能用？**
 格式里没存父指针，返回"不支持"比猜一个目录更诚实。
 
@@ -271,14 +378,17 @@ skip。装一个（Windows 版 QEMU，`qemu-system-i386.EXE` 在 `PATH` 或
 --arch 32` 重新构建；跑一遍测试确认没踩到别的东西。
 
 **32 位内核多大、还有多少余量？**
-引导器给内核留了 896 个扇区（448 KiB）；现在用了大约 160 个扇区。`build.py` 会在超预算
+引导器给内核留了 896 个扇区（448 KiB）；现在用了大约 224 个扇区。`build.py` 会在超预算
 时直接构建失败，而不是产出一个坏镜像。
 
 ## 现在还没有的
 
-分页与堆（`kmalloc`）、进程/线程、用户态和系统调用、多磁盘、时间戳和权限、追加写、
-大于 136704 字节的文件、中文输入、以及 64 位（目前没有这个计划）。完整的设计理由和
-一路踩过的坑在 [`docs/design.md`](docs/design.md)。
+`fork`/写时复制、信号、管道、把用户程序当成独立任务（`run` 现在仍然是"代替调用者同步地跑"）、
+多磁盘、时间戳和权限、追加写、大于 136704 字节的文件、中文输入、以及 64 位（目前没有这个
+计划）。分页、内核堆、**带系统调用的用户态**、以及**抢占式轮转调度器**都已经有了——前两个用
+`vm` 看真实数字，第三个用 `run` 跑，调度器用 `ps` 看任务表；后面七个阶段要做什么见
+[`docs/roadmap.md`](docs/roadmap.md)。完整的设计理由和一路踩过的坑在
+[`docs/design.md`](docs/design.md)。
 
 ## 环境要求
 

@@ -270,10 +270,83 @@ def show_live() -> None:
             print(f"    {index:2d}| {line.rstrip()}")
 
 
+def read_kernel_memory_constants() -> dict[str, int]:
+    """Parse the memory-layer constants out of the headers that define them.
+
+    Parsed rather than restated, for the same reason the boot constants are: a
+    report that repeats a number is a report that can drift from it.  The `u`
+    suffixes of C++ integer literals are stripped so the expressions can be
+    evaluated as Python.
+    """
+    constants: dict[str, int] = {}
+    for name in ("pmm.h", "paging.h", "heap.h", "usercopy.h", "task.h", "sched.h"):
+        text = (ROOT / "kernel32" / name).read_text(encoding="ascii")
+        for match in re.finditer(
+                r"constexpr\s+uint32\s+([A-Z0-9_]+)\s*=\s*([^;]+);", text):
+            key = match.group(1)
+            expression = match.group(2).split("//")[0].strip()
+            expression = re.sub(r"(\d)[uU]\b", r"\1", expression)
+            try:
+                value = eval(expression, {"__builtins__": {}}, constants)  # noqa: S307
+            except Exception:
+                continue
+            # C++ divides integers with `/`; Python 3 returns a float for it, so
+            # `(128 * 1024) / 4` arrives as 32768.0 and a bare isinstance(int) test
+            # would silently drop the constant.
+            if isinstance(value, float) and value.is_integer():
+                value = int(value)
+            if isinstance(value, int) and not isinstance(value, bool):
+                constants[key] = value
+    return constants
+
+
+def show_memory() -> None:
+    """What the 32-bit kernel's memory layer is configured to do."""
+    c = read_kernel_memory_constants()
+    if "PAGE_SIZE" not in c:
+        print("the memory-layer headers were not found under kernel32/")
+        return
+    cap_bytes = c["PMM_MAX_PAGES"] * c["PAGE_SIZE"]
+    print("kernel memory layer (kernel32/pmm.h, paging.h, heap.h, usercopy.h, "
+          "task.h, sched.h)")
+    print("-" * 62)
+    print(f"  page size              {c['PAGE_SIZE']} bytes")
+    print(f"  lowest managed address {c['PMM_MIN_ADDRESS']:#08x} "
+          f"(nothing below 1 MiB is handed out)")
+    print(f"  physical memory cap    {cap_bytes // (1024 * 1024)} MiB "
+          f"({c['PMM_MAX_PAGES']} pages, bitmap "
+          f"{c['PMM_MAX_PAGES'] // 8 // 1024} KiB)")
+    print(f"  page table span        {c['PAGE_TABLE_SPAN'] // (1024 * 1024)} MiB "
+          f"({c['PAGE_ENTRIES']} entries)")
+    print(f"  heap arena             {c['HEAP_ARENA_BYTES'] // 1024} KiB "
+          f"(block header {c['HEAP_MIN_ALIGN']} bytes aligned)")
+    print(f"  demand-zero regions    {c['PAGING_MAX_LAZY']} at a time")
+    if "USER_BASE" in c:
+        window = (c["USER_LIMIT"] - c["USER_BASE"]) // (1024 * 1024)
+        print(f"  user window            {c['USER_BASE']:#010x}..{c['USER_LIMIT']:#010x} "
+              f"({window} MiB); a user image may be {c['USER_IMAGE_MAX'] // 1024} KiB")
+        print(f"  user stack             {c['USER_STACK_BYTES'] // 1024} KiB at "
+              f"{c['USER_STACK_BOTTOM']:#010x}")
+    if "TASK_MAX" in c:
+        # The scheduler's own numbers.  The page-directory line is the one to watch:
+        # every task costs one page of directory on top of its stack, and the stacks
+        # come out of the same 1 MiB arena the kernel heap lives in.
+        print(f"  task slots             {c['TASK_MAX']} "
+              f"({c['TASK_STACK_BYTES'] // 1024} KiB kernel stack + 1 page directory each)")
+        print(f"  scheduler quantum      {c['SCHED_QUANTUM_TICKS']} tick(s) "
+              f"= {c['SCHED_QUANTUM_TICKS'] * 10} ms at 100 Hz")
+    print()
+    print("  measured at boot, not here: `vm` in the guest prints how much of this")
+    print("  the firmware actually reported, and what is in use; `ps` prints the task")
+    print("  table with the ticks each task has been charged")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="print the myos memory map")
     parser.add_argument("--constants", action="store_true")
     parser.add_argument("--kernel", action="store_true")
+    parser.add_argument("--memory", action="store_true",
+                        help="the 32-bit kernel's page/allocator/heap configuration")
     parser.add_argument("--image", action="store_true")
     parser.add_argument("--live", action="store_true",
                         help="boot the 16-bit image in the in-tree emulator and "
@@ -287,11 +360,13 @@ def main(argv: list[str] | None = None) -> int:
               "kernel use --arch 32 --kernel/--image, or QEMU via run.py")
         return 2
 
-    selected = args.constants or args.kernel or args.image or args.live
+    selected = args.constants or args.kernel or args.memory or args.image or args.live
     if not selected or args.constants:
         show_constants()
     if not selected or args.kernel:
         show_kernel(args.arch)
+    if args.memory or (not selected and args.arch == 32):
+        show_memory()
     if not selected or args.image:
         show_image(args.arch)
     if not selected or args.live:
